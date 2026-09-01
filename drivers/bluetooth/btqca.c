@@ -27,9 +27,6 @@
 
 #define VERSION "0.1"
 
-#define MAX_PATCH_FILE_SIZE (100*1024)
-#define MAX_NVM_FILE_SIZE   (10*1024)
-
 static int rome_patch_ver_req(struct hci_dev *hdev, u32 *rome_version)
 {
 	struct sk_buff *skb;
@@ -126,13 +123,25 @@ static void rome_tlv_check_data(struct rome_config *config,
 
 	type_len = le32_to_cpu(tlv->type_len);
 	length = (type_len >> 8) & 0x00ffffff;
+	if (config->type == TLV_TYPE_NVM && (type_len & 0xff) == 4) {
+		if (fw->size < 2 * sizeof(*tlv))
+			return;
+		tlv++;
+		type_len = le32_to_cpu(tlv->type_len);
+		length = (type_len >> 8) & 0x00ffffff;
+	}
 
 	BT_DBG("TLV Type\t\t : 0x%x", type_len & 0x000000ff);
 	BT_DBG("Length\t\t : %d bytes", length);
 
+	config->dnld_mode = ROME_SKIP_EVT_NONE;
+	config->dnld_type = ROME_SKIP_EVT_NONE;
+
 	switch (config->type) {
 	case TLV_TYPE_PATCH:
 		tlv_patch = (struct tlv_type_patch *)tlv->data;
+		config->dnld_mode = tlv_patch->download_mode;
+		config->dnld_type = config->dnld_mode;
 		BT_DBG("Total Length\t\t : %d bytes",
 		       le32_to_cpu(tlv_patch->total_size));
 		BT_DBG("Patch Data Length\t : %d bytes",
@@ -141,8 +150,9 @@ static void rome_tlv_check_data(struct rome_config *config,
 		       tlv_patch->format_version);
 		BT_DBG("Signature Algorithm\t : 0x%x",
 		       tlv_patch->signature);
-		BT_DBG("Reserved\t\t : 0x%x",
-		       le16_to_cpu(tlv_patch->reserved1));
+		BT_DBG("Download Mode\t\t : 0x%x",
+		       tlv_patch->download_mode);
+		BT_DBG("Reserved\t\t : 0x%x", tlv_patch->reserved1);
 		BT_DBG("Product ID\t\t : 0x%04x",
 		       le16_to_cpu(tlv_patch->product_id));
 		BT_DBG("Rom Build Version\t : 0x%04x",
@@ -198,7 +208,8 @@ static void rome_tlv_check_data(struct rome_config *config,
 }
 
 static int rome_tlv_send_segment(struct hci_dev *hdev, int idx, int seg_size,
-				 const u8 *data)
+				 const u8 *data,
+				 enum rome_tlv_dnld_mode mode)
 {
 	struct sk_buff *skb;
 	struct edl_event_hdr *edl;
@@ -211,6 +222,10 @@ static int rome_tlv_send_segment(struct hci_dev *hdev, int idx, int seg_size,
 	cmd[0] = EDL_PATCH_TLV_REQ_CMD;
 	cmd[1] = seg_size;
 	memcpy(cmd + 2, data, seg_size);
+
+	if (mode == ROME_SKIP_EVT_VSE_CC || mode == ROME_SKIP_EVT_VSE)
+		return __hci_cmd_send(hdev, EDL_PATCH_CMD_OPCODE, seg_size + 2,
+				      cmd);
 
 	skb = __hci_cmd_sync_ev(hdev, EDL_PATCH_CMD_OPCODE, seg_size + 2, cmd,
 				HCI_VENDOR_PKT, HCI_INIT_TIMEOUT);
@@ -248,38 +263,60 @@ out:
 	return err;
 }
 
-static int rome_tlv_download_request(struct hci_dev *hdev,
-				     const struct firmware *fw)
+static int rome_inject_cmd_complete_event(struct hci_dev *hdev)
 {
-	const u8 *buffer, *data;
-	int total_segment, remain_size;
-	int ret, i;
+	struct hci_event_hdr *hdr;
+	struct hci_ev_cmd_complete *evt;
+	struct sk_buff *skb;
+
+	skb = bt_skb_alloc(sizeof(*hdr) + sizeof(*evt) + 1, GFP_KERNEL);
+	if (!skb)
+		return -ENOMEM;
+
+	hdr = (struct hci_event_hdr *)skb_put(skb, sizeof(*hdr));
+	hdr->evt = HCI_EV_CMD_COMPLETE;
+	hdr->plen = sizeof(*evt) + 1;
+
+	evt = (struct hci_ev_cmd_complete *)skb_put(skb, sizeof(*evt));
+	evt->ncmd = 1;
+	evt->opcode = cpu_to_le16(QCA_HCI_CC_OPCODE);
+
+	*(u8 *)skb_put(skb, 1) = QCA_HCI_CC_SUCCESS;
+	hci_skb_pkt_type(skb) = HCI_EVENT_PKT;
+
+	return hci_recv_frame(hdev, skb);
+}
+
+static int rome_tlv_download_request(struct hci_dev *hdev,
+				     const struct firmware *fw,
+				     struct rome_config *config)
+{
+	const u8 *buffer;
+	int remain;
+	int ret, i = 0;
 
 	if (!fw || !fw->data)
 		return -EINVAL;
+	buffer = fw->data;
+	remain = fw->size;
 
-	total_segment = fw->size / MAX_SIZE_PER_TLV_SEGMENT;
-	remain_size = fw->size % MAX_SIZE_PER_TLV_SEGMENT;
+	while (remain > 0) {
+		int seg_size = min(MAX_SIZE_PER_TLV_SEGMENT, remain);
 
-	BT_DBG("%s: Total segment num %d remain size %d total size %zu",
-	       hdev->name, total_segment, remain_size, fw->size);
+		remain -= seg_size;
+		if (!remain || seg_size < MAX_SIZE_PER_TLV_SEGMENT)
+			config->dnld_mode = ROME_SKIP_EVT_NONE;
 
-	data = fw->data;
-	for (i = 0; i < total_segment; i++) {
-		buffer = data + i * MAX_SIZE_PER_TLV_SEGMENT;
-		ret = rome_tlv_send_segment(hdev, i, MAX_SIZE_PER_TLV_SEGMENT,
-					    buffer);
-		if (ret < 0)
-			return -EIO;
+		ret = rome_tlv_send_segment(hdev, i++, seg_size, buffer,
+					    config->dnld_mode);
+		if (ret)
+			return ret;
+		buffer += seg_size;
 	}
 
-	if (remain_size) {
-		buffer = data + total_segment * MAX_SIZE_PER_TLV_SEGMENT;
-		ret = rome_tlv_send_segment(hdev, total_segment, remain_size,
-					    buffer);
-		if (ret < 0)
-			return -EIO;
-	}
+	if (config->dnld_type == ROME_SKIP_EVT_VSE_CC ||
+	    config->dnld_type == ROME_SKIP_EVT_VSE)
+		return rome_inject_cmd_complete_event(hdev);
 
 	return 0;
 }
@@ -308,18 +345,6 @@ static int rome_download_firmware(struct hci_dev *hdev,
 		goto exit;
 	}
 
-	if (config->type == TLV_TYPE_PATCH &&
-		(fw->size > MAX_PATCH_FILE_SIZE)) {
-		ret = -EINVAL;
-		BT_ERR("TLV_PATCH dload: wrong patch file sizes");
-		goto exit;
-	} else if (config->type == TLV_TYPE_NVM &&
-		(fw->size > MAX_NVM_FILE_SIZE)) {
-		ret = -EINVAL;
-		BT_ERR("TLV_NVM dload: wrong NVM file sizes");
-		goto exit;
-	}
-
 	if (fw->size < sizeof(struct tlv_type_hdr)) {
 		ret = -EINVAL;
 		BT_ERR("Firware size smaller to fit minimum value");
@@ -337,7 +362,7 @@ static int rome_download_firmware(struct hci_dev *hdev,
 	}
 
 	rome_tlv_check_data(config, fw);
-	ret = rome_tlv_download_request(hdev, fw);
+	ret = rome_tlv_download_request(hdev, fw, config);
 
 	if (ret) {
 		BT_ERR("Failed to download FW: error = (%d)", ret);
@@ -379,6 +404,7 @@ int qca_uart_setup_rome(struct hci_dev *hdev, uint8_t baudrate)
 	u32 rome_ver = 0;
 	struct rome_config config;
 	int err;
+	u8 fw_ver;
 
 	BT_DBG("%s: ROME setup on UART", hdev->name);
 
@@ -392,21 +418,24 @@ int qca_uart_setup_rome(struct hci_dev *hdev, uint8_t baudrate)
 	}
 
 	BT_INFO("%s: ROME controller version 0x%08x", hdev->name, rome_ver);
+	fw_ver = ((rome_ver & 0x00000f00) >> 4) |
+		 (rome_ver & 0x0000000f);
 
 	/* Download rampatch file */
 	config.type = TLV_TYPE_PATCH;
-	snprintf(config.fwname, sizeof(config.fwname), "qca/rampatch_%08x.bin",
-		 rome_ver);
+	snprintf(config.fwname, sizeof(config.fwname), "qca/crbtfw%02x.tlv",
+		 fw_ver);
 	err = rome_download_firmware(hdev, &config);
 	if (err < 0) {
 		BT_ERR("%s: Failed to download patch (%d)", hdev->name, err);
 		return err;
 	}
+	msleep(10);
 
 	/* Download NVM configuration */
 	config.type = TLV_TYPE_NVM;
-	snprintf(config.fwname, sizeof(config.fwname), "qca/nvm_%08x.bin",
-		 rome_ver);
+	snprintf(config.fwname, sizeof(config.fwname), "qca/crnv%02x.bin",
+		 fw_ver);
 	err = rome_download_firmware(hdev, &config);
 	if (err < 0) {
 		BT_ERR("%s: Failed to download NVM (%d)", hdev->name, err);

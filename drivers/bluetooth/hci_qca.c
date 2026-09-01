@@ -29,7 +29,10 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/completion.h>
+#include <linux/delay.h>
 #include <linux/debugfs.h>
+#include <linux/tty.h>
 
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci_core.h>
@@ -45,10 +48,11 @@
 
 /* Controller states */
 #define STATE_IN_BAND_SLEEP_ENABLED	1
+#define STATE_DROP_VENDOR_EVENT		2
+#define HCI_EV_VENDOR			0xff
 
 #define IBS_WAKE_RETRANS_TIMEOUT_MS	100
 #define IBS_TX_IDLE_TIMEOUT_MS		2000
-#define BAUDRATE_SETTLE_TIMEOUT_MS	300
 
 /* HCI_IBS transmit side sleep protocol states */
 enum tx_ibs_states {
@@ -92,6 +96,7 @@ struct qca_data {
 	struct work_struct ws_rx_vote_off;
 	struct work_struct ws_tx_vote_off;
 	unsigned long flags;
+	struct completion drop_ev_comp;
 
 	/* For debugging purpose */
 	u64 ibs_sent_wacks;
@@ -410,6 +415,7 @@ static int qca_open(struct hci_uart *hu)
 	INIT_WORK(&qca->ws_tx_vote_off, qca_wq_serial_tx_clock_vote_off);
 
 	qca->hu = hu;
+	init_completion(&qca->drop_ev_comp);
 
 	/* Assume we start with both sides asleep -- extra wakes OK */
 	qca->tx_ibs_state = HCI_IBS_TX_ASLEEP;
@@ -763,6 +769,24 @@ static int qca_ibs_wake_ack(struct hci_dev *hdev, struct sk_buff *skb)
 	return 0;
 }
 
+static int qca_recv_event(struct hci_dev *hdev, struct sk_buff *skb)
+{
+	struct hci_uart *hu = hci_get_drvdata(hdev);
+	struct qca_data *qca = hu->priv;
+
+	if (test_bit(STATE_DROP_VENDOR_EVENT, &qca->flags)) {
+		struct hci_event_hdr *hdr = (void *)skb->data;
+
+		if (hdr->evt == HCI_EV_VENDOR)
+			complete(&qca->drop_ev_comp);
+
+		kfree_skb(skb);
+		return 0;
+	}
+
+	return hci_recv_frame(hdev, skb);
+}
+
 #define QCA_IBS_SLEEP_IND_EVENT \
 	.type = HCI_IBS_SLEEP_IND, \
 	.hlen = 0, \
@@ -787,7 +811,7 @@ static int qca_ibs_wake_ack(struct hci_dev *hdev, struct sk_buff *skb)
 static const struct h4_recv_pkt qca_recv_pkts[] = {
 	{ H4_RECV_ACL,             .recv = hci_recv_frame    },
 	{ H4_RECV_SCO,             .recv = hci_recv_frame    },
-	{ H4_RECV_EVENT,           .recv = hci_recv_frame    },
+	{ H4_RECV_EVENT,           .recv = qca_recv_event    },
 	{ QCA_IBS_WAKE_IND_EVENT,  .recv = qca_ibs_wake_ind  },
 	{ QCA_IBS_WAKE_ACK_EVENT,  .recv = qca_ibs_wake_ack  },
 	{ QCA_IBS_SLEEP_IND_EVENT, .recv = qca_ibs_sleep_ind },
@@ -865,7 +889,7 @@ static int qca_set_baudrate(struct hci_dev *hdev, uint8_t baudrate)
 
 	cmd[4] = baudrate;
 
-	skb = bt_skb_alloc(sizeof(cmd), GFP_ATOMIC);
+	skb = bt_skb_alloc(sizeof(cmd), GFP_KERNEL);
 	if (!skb) {
 		BT_ERR("Failed to allocate memory for baudrate packet");
 		return -ENOMEM;
@@ -878,13 +902,10 @@ static int qca_set_baudrate(struct hci_dev *hdev, uint8_t baudrate)
 	skb_queue_tail(&qca->txq, skb);
 	hci_uart_tx_wakeup(hu);
 
-	/* wait 300ms to change new baudrate on controller side
-	 * controller will come back after they receive this HCI command
-	 * then host can communicate with new baudrate to controller
-	 */
-	set_current_state(TASK_UNINTERRUPTIBLE);
-	schedule_timeout(msecs_to_jiffies(BAUDRATE_SETTLE_TIMEOUT_MS));
-	set_current_state(TASK_INTERRUPTIBLE);
+	while (!skb_queue_empty(&qca->txq))
+		usleep_range(100, 200);
+	tty_wait_until_sent(hu->tty, msecs_to_jiffies(100));
+	msleep(10);
 
 	return 0;
 }
@@ -922,13 +943,25 @@ static int qca_setup(struct hci_uart *hu)
 		qca_baudrate = qca_get_baudrate_value(speed);
 
 		BT_INFO("%s: Set UART speed to %d", hdev->name, speed);
+		hci_uart_set_flow_control(hu, true);
+		reinit_completion(&qca->drop_ev_comp);
+		set_bit(STATE_DROP_VENDOR_EVENT, &qca->flags);
 		ret = qca_set_baudrate(hdev, qca_baudrate);
 		if (ret) {
+			hci_uart_set_flow_control(hu, false);
+			clear_bit(STATE_DROP_VENDOR_EVENT, &qca->flags);
 			BT_ERR("%s: Failed to change the baud rate (%d)",
 			       hdev->name, ret);
 			return ret;
 		}
 		hci_uart_set_baudrate(hu, speed);
+		hci_uart_set_flow_control(hu, false);
+		if (!wait_for_completion_timeout(&qca->drop_ev_comp,
+					 msecs_to_jiffies(100))) {
+			BT_INFO("%s: Baudrate change event not reported",
+			       hdev->name);
+		}
+		clear_bit(STATE_DROP_VENDOR_EVENT, &qca->flags);
 	}
 
 	/* Setup patch / NVM configurations */
