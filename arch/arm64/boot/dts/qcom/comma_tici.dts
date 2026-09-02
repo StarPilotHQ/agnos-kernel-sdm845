@@ -16,6 +16,14 @@
 #include "sda845-v2.1.dtsi"
 #include "comma_common.dtsi"
 
+&pcie0 {
+  status = "okay";
+};
+
+&pcie1 {
+  status = "okay";
+};
+
 &qupv3_se5_i2c {
   status = "ok";
   qcom,clk-freq-out = <100000>;
