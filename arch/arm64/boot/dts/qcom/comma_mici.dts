@@ -194,6 +194,14 @@ status = "ok";
   qcom,platform-reset-gpio = <&tlmm 6 0>;
   //qcom,panel-errfg-gpio = <&tlmm 135 0>
 
+  /*
+   * -3.5 V ELVSS with FE05:2A bit 0 removes most of the red glow in black
+   * areas. It survives warm reboots: to roll back, set 0 and keep these
+   * properties and the panel's reinit flag.
+   */
+  qcom,mdss-dsi-reinit-ibb-pmic = <&pmi8998_lsid1>;
+  qcom,mdss-dsi-reinit-ibb-microvolt = <3500000>;
+
   qcom,mdss-dsi-t-clk-post = <0x0e>;
   qcom,mdss-dsi-t-clk-pre = <0x31>;
   qcom,mdss-dsi-display-timings {

@@ -382,7 +382,27 @@ Optional properties:
 					retries, the post-on commands are sent before the panel is used
 					and, if they succeed, exit sleep and display on, so a panel with
 					paged command sets should return to its user page in
-					qcom,mdss-dsi-post-panel-on-command. Failures are only logged.
+					qcom,mdss-dsi-post-panel-on-command. Failures are only logged;
+					with qcom,mdss-dsi-reinit-ibb-pmic the panel can also be left
+					asleep.
+- qcom,mdss-dsi-reinit-ibb-pmic:		Phandle of the PMI8998 slave that holds the IBB (ELVSS)
+					regulator. With qcom,mdss-dsi-reinit-after-cont-splash, the IBB
+					voltage is set between the off and on commands, while the panel
+					sleeps with both rails off. Nothing is written while a short
+					circuit is flagged or if the IBB/LAB identity is unexpected; an
+					override also needs the expected IBB configuration and a current
+					voltage of 0 or 2.9 to 3.5 V. If the voltage is then unknown, or an
+					override is active while a short circuit is flagged, the panel is
+					left asleep. This is only logged: the display enable still
+					succeeds, and the next display power-up, such as a wake from
+					sleep, turns the panel on without these checks.
+- qcom,mdss-dsi-reinit-ibb-microvolt:	IBB voltage magnitude in microvolts for
+					qcom,mdss-dsi-reinit-ibb-pmic: 2900000 to 3500000 in steps of
+					100000, or 0 to restore the PMIC's own voltage. The override
+					persists across warm reboots: to roll it back, set 0 and keep
+					these properties and qcom,mdss-dsi-reinit-after-cont-splash.
+					Removing any of them leaves the override in place until the next
+					cold boot, such as after a poweroff.
 - qcom,mdss-dsi-init-delay-us:		Delay in microseconds(us) before performing any DSI activity in lp11
 					mode. This master delay (t_init_delay as per DSI spec) should be sum
 					of DSI internal delay to reach fuctional after power up and minimum

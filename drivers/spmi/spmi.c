@@ -384,6 +384,32 @@ static struct bus_type spmi_bus_type = {
 	.uevent		= spmi_drv_uevent,
 };
 
+static int spmi_of_node_match(struct device *dev, void *np)
+{
+	return dev->of_node == np;
+}
+
+/**
+ * spmi_find_device_by_of_node() - look up an SPMI device from a device node
+ *
+ * @np:		device node
+ *
+ * Takes a reference to the embedded struct device which needs to be dropped
+ * after use.
+ *
+ * Returns the struct spmi_device associated with a device node or NULL.
+ */
+struct spmi_device *spmi_find_device_by_of_node(struct device_node *np)
+{
+	struct device *dev = bus_find_device(&spmi_bus_type, NULL, np,
+					     spmi_of_node_match);
+
+	if (dev)
+		return to_spmi_device(dev);
+	return NULL;
+}
+EXPORT_SYMBOL_GPL(spmi_find_device_by_of_node);
+
 /**
  * spmi_controller_alloc() - Allocate a new SPMI device
  * @ctrl:	associated controller

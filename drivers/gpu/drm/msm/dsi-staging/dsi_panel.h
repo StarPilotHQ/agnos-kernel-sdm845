@@ -184,6 +184,8 @@ struct dsi_panel {
 
 	bool panel_initialized;
 	bool reinit_after_splash;
+	struct device_node *ibb_pmic;
+	u32 ibb_uv;
 	bool te_using_watchdog_timer;
 
 	char dsc_pps_cmd[DSI_CMD_PPS_SIZE];

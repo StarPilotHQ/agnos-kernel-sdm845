@@ -19,6 +19,8 @@
 #include <linux/of_gpio.h>
 #include <video/mipi_display.h>
 #include <linux/firmware.h>
+#include <linux/regmap.h>
+#include <linux/spmi.h>
 
 #include "dsi_panel.h"
 #include "dsi_ctrl_hw.h"
@@ -1768,6 +1770,238 @@ error:
 	return rc;
 }
 
+/*
+ * PMI8998 IBB (ELVSS) and LAB (ELVDD) registers, as named in
+ * qpnp-labibb-regulator.c. A panel's reinit after continuous splash can set
+ * the IBB voltage while the panel sleeps and both rails are off.
+ */
+#define IBB_BASE			0xdc00
+#define LAB_BASE			0xde00
+#define LABIBB_PERPH_TYPE		0x04
+#define LABIBB_STATUS1			0x08
+#define LABIBB_STATUS1_VREG_OK		BIT(7)
+#define LABIBB_STATUS1_SC_DETECT	BIT(6)
+#define IBB_VOLTAGE			0x41
+#define IBB_VOLTAGE_OVERRIDE_EN		BIT(7)
+#define IBB_LCD_AMOLED_SEL		0x44
+#define IBB_ENABLE_CTL			0x46
+#define IBB_SWIRE_CTL			0x5a
+#define IBB_MIN_UV			1400000
+#define IBB_STEP_UV			100000
+#define IBB_OVERRIDE_MIN_UV		2900000
+#define IBB_OVERRIDE_MAX_UV		3500000
+#define IBB_RAILS_OFF_POLLS		50
+
+static const struct {
+	u16 reg;
+	u8 val;
+} dsi_panel_ibb_expected[] = {
+	/* identity: checked for every write */
+	{ IBB_BASE + LABIBB_PERPH_TYPE, 0x20 },
+	{ LAB_BASE + LABIBB_PERPH_TYPE, 0x24 },
+	/* configuration: checked before setting an override */
+	{ IBB_BASE + IBB_LCD_AMOLED_SEL, 0x80 },	/* AMOLED */
+	{ IBB_BASE + IBB_ENABLE_CTL, 0x40 },	/* enabled over SWIRE */
+	{ IBB_BASE + IBB_SWIRE_CTL, 0x27 },	/* SWIRE sets no voltage */
+};
+
+#define IBB_IDENTITY_REGS		2
+
+static unsigned int dsi_panel_ibb_code(u32 uv)
+{
+	return uv ? IBB_VOLTAGE_OVERRIDE_EN | (uv - IBB_MIN_UV) / IBB_STEP_UV
+		  : 0;
+}
+
+/* 0 restores the PMIC's own voltage; otherwise a measured override */
+static bool dsi_panel_ibb_uv_valid(u32 uv)
+{
+	return !uv || (uv >= IBB_OVERRIDE_MIN_UV &&
+		       uv <= IBB_OVERRIDE_MAX_UV && !(uv % IBB_STEP_UV));
+}
+
+static bool dsi_panel_ibb_code_known(unsigned int code)
+{
+	return !code || (code >= dsi_panel_ibb_code(IBB_OVERRIDE_MIN_UV) &&
+			 code <= dsi_panel_ibb_code(IBB_OVERRIDE_MAX_UV));
+}
+
+#define IBB_RAIL_ON			BIT(0)
+#define LAB_RAIL_ON			BIT(1)
+
+/*
+ * Read both STATUS1 registers into *on (IBB_RAIL_ON, LAB_RAIL_ON), recording
+ * a short circuit as soon as it is read.
+ */
+static int dsi_panel_ibb_rails(struct regmap *map, unsigned int *on,
+			       bool *short_seen)
+{
+	unsigned int ibb, lab;
+	int rc;
+
+	rc = regmap_read(map, IBB_BASE + LABIBB_STATUS1, &ibb);
+	if (rc)
+		return rc;
+	if (ibb & LABIBB_STATUS1_SC_DETECT)
+		*short_seen = true;
+	rc = regmap_read(map, LAB_BASE + LABIBB_STATUS1, &lab);
+	if (rc)
+		return rc;
+	if (lab & LABIBB_STATUS1_SC_DETECT)
+		*short_seen = true;
+	*on = (ibb & LABIBB_STATUS1_VREG_OK ? IBB_RAIL_ON : 0) |
+	      (lab & LABIBB_STATUS1_VREG_OK ? LAB_RAIL_ON : 0);
+	return 0;
+}
+
+/* 0 once both rails are off with no short circuit flagged */
+static int dsi_panel_ibb_wait_off(struct regmap *map, unsigned int *on,
+				  bool *short_seen)
+{
+	int i, rc;
+
+	for (i = 0; i < IBB_RAILS_OFF_POLLS; i++) {
+		rc = dsi_panel_ibb_rails(map, on, short_seen);
+		if (rc)
+			return rc;
+		if (*short_seen)
+			return -EIO;
+		if (!*on)
+			return 0;
+		usleep_range(10000, 11000);
+	}
+	return -ETIMEDOUT;
+}
+
+static struct spmi_device *dsi_panel_ibb_find(struct dsi_panel *panel)
+{
+	if (!IS_REACHABLE(CONFIG_SPMI))
+		return NULL;
+	return spmi_find_device_by_of_node(panel->ibb_pmic);
+}
+
+/* Check the identity, and the configuration too unless only restoring stock */
+static int dsi_panel_ibb_check(struct regmap *map, struct dsi_panel *panel,
+			       unsigned int code)
+{
+	int i, rc, n = code ? ARRAY_SIZE(dsi_panel_ibb_expected) :
+			      IBB_IDENTITY_REGS;
+	unsigned int val;
+
+	for (i = 0; i < n; i++) {
+		rc = regmap_read(map, dsi_panel_ibb_expected[i].reg, &val);
+		if (rc || val != dsi_panel_ibb_expected[i].val) {
+			pr_err("[%s] unexpected IBB state at 0x%04x\n",
+			       panel->name, dsi_panel_ibb_expected[i].reg);
+			return -ENODEV;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Called with panel_lock held, after the off commands, while the panel sleeps.
+ * Sets the IBB voltage the board asks for. Returns false if the panel should
+ * stay asleep: the voltage register may hold a value nobody asked for, or an
+ * override is active while a short circuit is flagged.
+ */
+static bool dsi_panel_set_ibb(struct dsi_panel *panel)
+{
+	unsigned int code = dsi_panel_ibb_code(panel->ibb_uv), val = 0, now = 0;
+	unsigned int on = 0;
+	bool short_seen = false, wake = true;
+	struct spmi_device *sdev;
+	struct regmap *map;
+	int rc;
+
+	sdev = dsi_panel_ibb_find(panel);
+	if (!sdev) {
+		pr_err("[%s] IBB PMIC not found, voltage not set\n",
+		       panel->name);
+		return true;
+	}
+	map = dev_get_regmap(&sdev->dev, NULL);
+	if (!map || dsi_panel_ibb_check(map, panel, 0) ||
+	    regmap_read(map, IBB_BASE + IBB_VOLTAGE, &val)) {
+		pr_err("[%s] IBB voltage not set\n", panel->name);
+		goto out;
+	}
+
+	/* Never write while a short circuit is flagged */
+	rc = dsi_panel_ibb_wait_off(map, &on, &short_seen);
+	if (short_seen) {
+		pr_err("[%s] IBB/LAB short circuit flagged, voltage 0x%02x kept\n",
+		       panel->name, val);
+		wake = !val;
+		goto out;
+	}
+	if (val == code) {
+		/* kept from before a warm reboot */
+		if (code)
+			pr_info("[%s] IBB voltage %u uV kept\n", panel->name,
+				panel->ibb_uv);
+		goto out;
+	}
+	if (code && !dsi_panel_ibb_code_known(val)) {
+		pr_err("[%s] unexpected IBB voltage 0x%02x, not changed\n",
+		       panel->name, val);
+		goto out;
+	}
+	/* Both rails off and no short circuit, read last before the write */
+	if (!rc)
+		rc = dsi_panel_ibb_check(map, panel, code);
+	if (!rc)
+		rc = dsi_panel_ibb_rails(map, &on, &short_seen);
+	if (rc || on || short_seen) {
+		pr_err("[%s] IBB voltage not set: rails on 0x%x, short %d, rc=%d\n",
+		       panel->name, on, short_seen, rc);
+		wake = !(short_seen && val);
+		goto out;
+	}
+
+	rc = regmap_write(map, IBB_BASE + IBB_VOLTAGE, code);
+	if (!rc)
+		rc = regmap_read(map, IBB_BASE + IBB_VOLTAGE, &now);
+	if (!rc && now == code) {
+		if (code)
+			pr_info("[%s] IBB voltage set to %u uV\n",
+				panel->name, panel->ibb_uv);
+		else
+			pr_info("[%s] IBB voltage override cleared\n",
+				panel->name);
+		goto out;
+	}
+
+	/* The write may have landed: return to stock while the rails are off */
+	pr_err("[%s] IBB voltage not confirmed, rc=%d\n", panel->name, rc);
+	if (code && !dsi_panel_ibb_wait_off(map, &on, &short_seen))
+		regmap_write(map, IBB_BASE + IBB_VOLTAGE, 0);
+	wake = !regmap_read(map, IBB_BASE + IBB_VOLTAGE, &val) &&
+	       dsi_panel_ibb_code_known(val) && !(short_seen && val);
+out:
+	put_device(&sdev->dev);
+	return wake;
+}
+
+/* After the panel wakes: log if either rail is not regulating or shorted */
+static void dsi_panel_ibb_verify(struct dsi_panel *panel)
+{
+	unsigned int on = 0;
+	bool short_seen = false;
+	struct spmi_device *sdev;
+	struct regmap *map;
+
+	sdev = dsi_panel_ibb_find(panel);
+	if (!sdev)
+		return;
+	map = dev_get_regmap(&sdev->dev, NULL);
+	if (map && (dsi_panel_ibb_rails(map, &on, &short_seen) ||
+		    on != (IBB_RAIL_ON | LAB_RAIL_ON) || short_seen))
+		pr_err("[%s] IBB/LAB rails not regulating after wake\n",
+		       panel->name);
+	put_device(&sdev->dev);
+}
+
 static int dsi_panel_parse_misc_features(struct dsi_panel *panel,
 				     struct device_node *of_node)
 {
@@ -1794,6 +2028,17 @@ static int dsi_panel_parse_misc_features(struct dsi_panel *panel,
 
 	panel->reinit_after_splash = of_property_read_bool(of_node,
 			"qcom,mdss-dsi-reinit-after-cont-splash");
+
+	panel->ibb_pmic = of_parse_phandle(of_node,
+			"qcom,mdss-dsi-reinit-ibb-pmic", 0);
+	if (panel->ibb_pmic && (of_property_read_u32(of_node,
+			"qcom,mdss-dsi-reinit-ibb-microvolt", &panel->ibb_uv) ||
+			!dsi_panel_ibb_uv_valid(panel->ibb_uv))) {
+		pr_err("[%s] invalid qcom,mdss-dsi-reinit-ibb-microvolt\n",
+		       panel->name);
+		of_node_put(panel->ibb_pmic);
+		panel->ibb_pmic = NULL;
+	}
 	return 0;
 }
 
@@ -2978,6 +3223,7 @@ struct dsi_panel *dsi_panel_get(struct device *parent,
 	panel->parent = parent;
 	return panel;
 error:
+	of_node_put(panel->ibb_pmic);
 	kfree(panel);
 	return ERR_PTR(rc);
 }
@@ -2988,6 +3234,7 @@ void dsi_panel_put(struct dsi_panel *panel)
 	if (panel->type == DSI_PANEL)
 		dsi_panel_esd_config_deinit(&panel->esd_config);
 
+	of_node_put(panel->ibb_pmic);
 	kfree(panel);
 }
 
@@ -3681,7 +3928,9 @@ int dsi_panel_enable(struct dsi_panel *panel)
  * Send the off command set, then the on command set, for a panel that
  * continuous splash hands over without the kernel's own initialization.
  * The whole on set is tried up to 3 times. Returns the result of the
- * last on attempt.
+ * last on attempt, or -EIO if the panel was left asleep: its IBB voltage
+ * could not be confirmed, or an override is active while a short circuit
+ * is flagged.
  */
 int dsi_panel_reinit(struct dsi_panel *panel)
 {
@@ -3700,9 +3949,15 @@ int dsi_panel_reinit(struct dsi_panel *panel)
 	 */
 	rc = dsi_panel_tx_cmd_set_state(panel, DSI_CMD_SET_OFF,
 					DSI_CMD_SET_STATE_HS);
-	if (rc)
+	if (rc) {
 		pr_err("[%s] failed to send DSI_CMD_SET_OFF cmds, rc=%d\n",
 		       panel->name, rc);
+	} else if (panel->ibb_pmic && !dsi_panel_set_ibb(panel)) {
+		pr_err("[%s] IBB voltage unknown, or an override is active under a short circuit: panel left asleep\n",
+		       panel->name);
+		mutex_unlock(&panel->panel_lock);
+		return -EIO;
+	}
 
 	/*
 	 * Send the on commands even if the off commands failed, to wake the
@@ -3717,6 +3972,9 @@ int dsi_panel_reinit(struct dsi_panel *panel)
 		pr_err("[%s] failed to send DSI_CMD_SET_ON cmds, rc=%d\n",
 		       panel->name, rc);
 	}
+
+	if (!rc && panel->ibb_pmic)
+		dsi_panel_ibb_verify(panel);
 
 	/*
 	 * If they never succeeded, send the post-on commands now, before the
