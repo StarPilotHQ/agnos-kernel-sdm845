@@ -6491,6 +6491,16 @@ int dsi_display_enable(struct dsi_display *display)
 			return -EINVAL;
 		}
 
+		/*
+		 * Some panels need the sleep and wake cycle of the kernel's
+		 * own initialization, which the bootloader handover skips.
+		 * Errors are only logged: failing the enable would unprepare
+		 * the display, and marking the panel initialized keeps the
+		 * backlight control that dims and blanks it.
+		 */
+		if (display->panel->reinit_after_splash)
+			dsi_panel_reinit(display->panel);
+
 		display->panel->panel_initialized = true;
 		pr_debug("cont splash enabled, display enable not required\n");
 		return 0;

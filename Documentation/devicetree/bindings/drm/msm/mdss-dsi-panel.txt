@@ -375,6 +375,14 @@ Optional properties:
                                         10000.
 - qcom,mdss-dsi-lp11-init:		Boolean used to enable the DSI clocks and data lanes (low power 11)
 					before issuing hardware reset line.
+- qcom,mdss-dsi-reinit-after-cont-splash:	Boolean used to send the off and on commands once
+					at the first enable after continuous splash, for panels whose
+					bootloader initialization differs from the kernel's. They are sent
+					in high speed while video runs. If the on commands still fail after
+					retries, the post-on commands are sent before the panel is used
+					and, if they succeed, exit sleep and display on, so a panel with
+					paged command sets should return to its user page in
+					qcom,mdss-dsi-post-panel-on-command. Failures are only logged.
 - qcom,mdss-dsi-init-delay-us:		Delay in microseconds(us) before performing any DSI activity in lp11
 					mode. This master delay (t_init_delay as per DSI spec) should be sum
 					of DSI internal delay to reach fuctional after power up and minimum

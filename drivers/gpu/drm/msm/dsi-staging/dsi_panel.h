@@ -183,6 +183,7 @@ struct dsi_panel {
 	bool allow_phy_power_off;
 
 	bool panel_initialized;
+	bool reinit_after_splash;
 	bool te_using_watchdog_timer;
 
 	char dsc_pps_cmd[DSI_CMD_PPS_SIZE];
@@ -257,6 +258,8 @@ int dsi_panel_set_nolp(struct dsi_panel *panel);
 int dsi_panel_prepare(struct dsi_panel *panel);
 
 int dsi_panel_enable(struct dsi_panel *panel);
+
+int dsi_panel_reinit(struct dsi_panel *panel);
 
 int dsi_panel_post_enable(struct dsi_panel *panel);
 

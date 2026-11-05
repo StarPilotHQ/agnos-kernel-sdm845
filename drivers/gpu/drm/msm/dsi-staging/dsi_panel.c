@@ -493,14 +493,14 @@ static int dsi_panel_power_off(struct dsi_panel *panel)
 
 	return rc;
 }
-static int dsi_panel_tx_cmd_set(struct dsi_panel *panel,
-				enum dsi_cmd_set_type type)
+static int dsi_panel_tx_cmd_set_state(struct dsi_panel *panel,
+				enum dsi_cmd_set_type type,
+				enum dsi_cmd_set_state state)
 {
 	int rc = 0, i = 0;
 	ssize_t len;
 	struct dsi_cmd_desc *cmds;
 	u32 count;
-	enum dsi_cmd_set_state state;
 	struct dsi_display_mode *mode;
 	const struct mipi_dsi_host_ops *ops = panel->host->ops;
 
@@ -514,7 +514,6 @@ static int dsi_panel_tx_cmd_set(struct dsi_panel *panel,
 
 	cmds = mode->priv_info->cmd_sets[type].cmds;
 	count = mode->priv_info->cmd_sets[type].count;
-	state = mode->priv_info->cmd_sets[type].state;
 
 	if (count == 0) {
 		pr_debug("[%s] No commands to be sent for state(%d)\n",
@@ -525,6 +524,8 @@ static int dsi_panel_tx_cmd_set(struct dsi_panel *panel,
 	for (i = 0; i < count; i++) {
 		if (state == DSI_CMD_SET_STATE_LP)
 			cmds->msg.flags |= MIPI_DSI_MSG_USE_LPM;
+		else
+			cmds->msg.flags &= ~MIPI_DSI_MSG_USE_LPM;
 
 		if (cmds->last_command)
 			cmds->msg.flags |= MIPI_DSI_MSG_LASTCOMMAND;
@@ -542,6 +543,16 @@ static int dsi_panel_tx_cmd_set(struct dsi_panel *panel,
 	}
 error:
 	return rc;
+}
+
+static int dsi_panel_tx_cmd_set(struct dsi_panel *panel,
+				enum dsi_cmd_set_type type)
+{
+	if (!panel || !panel->cur_mode)
+		return -EINVAL;
+
+	return dsi_panel_tx_cmd_set_state(panel, type,
+			panel->cur_mode->priv_info->cmd_sets[type].state);
 }
 
 static int dsi_panel_pinctrl_deinit(struct dsi_panel *panel)
@@ -1780,6 +1791,9 @@ static int dsi_panel_parse_misc_features(struct dsi_panel *panel,
 
 	panel->lp11_init = of_property_read_bool(of_node,
 			"qcom,mdss-dsi-lp11-init");
+
+	panel->reinit_after_splash = of_property_read_bool(of_node,
+			"qcom,mdss-dsi-reinit-after-cont-splash");
 	return 0;
 }
 
@@ -3659,6 +3673,74 @@ int dsi_panel_enable(struct dsi_panel *panel)
 		       panel->name, rc);
 	}
 	panel->panel_initialized = true;
+	mutex_unlock(&panel->panel_lock);
+	return rc;
+}
+
+/*
+ * Send the off command set, then the on command set, for a panel that
+ * continuous splash hands over without the kernel's own initialization.
+ * The whole on set is tried up to 3 times. Returns the result of the
+ * last on attempt.
+ */
+int dsi_panel_reinit(struct dsi_panel *panel)
+{
+	int rc, i;
+
+	if (!panel) {
+		pr_err("Invalid params\n");
+		return -EINVAL;
+	}
+
+	mutex_lock(&panel->panel_lock);
+
+	/*
+	 * The video stream is already running, so send in high speed, as
+	 * the backlight commands are.
+	 */
+	rc = dsi_panel_tx_cmd_set_state(panel, DSI_CMD_SET_OFF,
+					DSI_CMD_SET_STATE_HS);
+	if (rc)
+		pr_err("[%s] failed to send DSI_CMD_SET_OFF cmds, rc=%d\n",
+		       panel->name, rc);
+
+	/*
+	 * Send the on commands even if the off commands failed, to wake the
+	 * panel. A failed attempt stops partway through the set, so retry the
+	 * whole set rather than leave the panel half initialized.
+	 */
+	for (i = 0; i < 3; i++) {
+		rc = dsi_panel_tx_cmd_set_state(panel, DSI_CMD_SET_ON,
+						DSI_CMD_SET_STATE_HS);
+		if (!rc)
+			break;
+		pr_err("[%s] failed to send DSI_CMD_SET_ON cmds, rc=%d\n",
+		       panel->name, rc);
+	}
+
+	/*
+	 * If they never succeeded, send the post-on commands now, before the
+	 * lock is released and backlight commands can reach the panel: a
+	 * panel with paged command sets uses them to return to its user page.
+	 * If they succeed, also try to wake the panel, so the screen isn't
+	 * left dark.
+	 */
+	if (rc) {
+		if (dsi_panel_tx_cmd_set_state(panel, DSI_CMD_SET_POST_ON,
+					       DSI_CMD_SET_STATE_HS)) {
+			pr_err("[%s] failed to send DSI_CMD_SET_POST_ON cmds\n",
+			       panel->name);
+		} else {
+			if (mipi_dsi_dcs_exit_sleep_mode(&panel->mipi_device))
+				pr_err("[%s] failed to exit sleep mode\n",
+				       panel->name);
+			msleep(120);
+			if (mipi_dsi_dcs_set_display_on(&panel->mipi_device))
+				pr_err("[%s] failed to set display on\n",
+				       panel->name);
+		}
+	}
+
 	mutex_unlock(&panel->panel_lock);
 	return rc;
 }
