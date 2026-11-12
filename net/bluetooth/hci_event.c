@@ -4666,9 +4666,9 @@ static struct hci_conn *check_pending_le_conn(struct hci_dev *hdev,
 
 	/* Most controller will fail if we try to create new connections
 	 * while we have an existing one in slave role, unless it reports
-	 * that combination as supported (bit 28).
+	 * that combination as supported (bit 41).
 	 */
-	if (hdev->conn_hash.le_num_slave > 0 && !(hdev->le_states[3] & 0x10))
+	if (hdev->conn_hash.le_num_slave > 0 && !(hdev->le_states[5] & 0x02))
 		return NULL;
 
 	/* If we're not connectable only connect devices that we have in
