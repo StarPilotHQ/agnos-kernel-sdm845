@@ -4615,6 +4615,10 @@ static void hci_le_conn_complete_evt(struct hci_dev *hdev, struct sk_buff *skb)
 		}
 	}
 
+	/* Advertising was disabled to create this connection. */
+	if (conn->out)
+		hci_req_reenable_advertising(hdev);
+
 unlock:
 	hci_update_background_scan(hdev);
 	hci_dev_unlock(hdev);
@@ -4661,9 +4665,10 @@ static struct hci_conn *check_pending_le_conn(struct hci_dev *hdev,
 		return NULL;
 
 	/* Most controller will fail if we try to create new connections
-	 * while we have an existing one in slave role.
+	 * while we have an existing one in slave role, unless it reports
+	 * that combination as supported (bit 28).
 	 */
-	if (hdev->conn_hash.le_num_slave > 0)
+	if (hdev->conn_hash.le_num_slave > 0 && !(hdev->le_states[3] & 0x10))
 		return NULL;
 
 	/* If we're not connectable only connect devices that we have in
