@@ -5154,6 +5154,18 @@ static void hci_le_direct_adv_report_evt(struct hci_dev *hdev,
 	hci_dev_unlock(hdev);
 }
 
+static void hci_le_phy_update_evt(struct hci_dev *hdev, struct sk_buff *skb)
+{
+	struct hci_ev_le_phy_update_complete *ev = (void *) skb->data;
+
+	if (skb->len < sizeof(*ev))
+		return;
+
+	BT_INFO("%s LE PHY update handle 0x%4.4x status 0x%2.2x tx %u rx %u",
+		hdev->name, __le16_to_cpu(ev->handle), ev->status,
+		ev->tx_phy, ev->rx_phy);
+}
+
 static void hci_le_meta_evt(struct hci_dev *hdev, struct sk_buff *skb)
 {
 	struct hci_ev_le_meta *le_ev = (void *) skb->data;
@@ -5187,6 +5199,10 @@ static void hci_le_meta_evt(struct hci_dev *hdev, struct sk_buff *skb)
 
 	case HCI_EV_LE_DIRECT_ADV_REPORT:
 		hci_le_direct_adv_report_evt(hdev, skb);
+		break;
+
+	case HCI_EV_LE_PHY_UPDATE_COMPLETE:
+		hci_le_phy_update_evt(hdev, skb);
 		break;
 
 	default:

@@ -690,6 +690,12 @@ static int hci_init3_req(struct hci_request *req, unsigned long opt)
 		if (hdev->commands[34] & 0x04)
 			events[1] |= 0x01;	/* LE Generate DHKey Complete */
 
+		/* If the controller supports the LE Set Default PHY or
+		 * LE Set PHY commands, enable the corresponding event.
+		 */
+		if (hdev->commands[35] & (0x20 | 0x40))
+			events[1] |= 0x08;	/* LE PHY Update Complete */
+
 		hci_req_add(req, HCI_OP_LE_SET_EVENT_MASK, sizeof(events),
 			    events);
 
@@ -774,6 +780,29 @@ static int hci_init4_req(struct hci_request *req, unsigned long opt)
 	/* Check for Synchronization Train support */
 	if (lmp_sync_train_capable(hdev))
 		hci_req_add(req, HCI_OP_READ_SYNC_TRAIN_PARAMS, 0, NULL);
+
+	/* Set Suggested Default Data Length to maximum if supported */
+	if (hdev->le_features[0] & HCI_LE_DATA_LEN_EXT) {
+		struct hci_cp_le_write_def_data_len cp;
+
+		cp.tx_len = cpu_to_le16(hdev->le_max_tx_len);
+		cp.tx_time = cpu_to_le16(hdev->le_max_tx_time);
+		hci_req_add(req, HCI_OP_LE_WRITE_DEF_DATA_LEN, sizeof(cp), &cp);
+	}
+
+	/* Prefer the 2M PHY by default if the controller supports it */
+	if (hdev->commands[35] & 0x20) {
+		struct hci_cp_le_set_default_phy cp;
+
+		cp.all_phys = 0x00;
+		cp.tx_phys = HCI_LE_SET_PHY_1M;
+		cp.rx_phys = HCI_LE_SET_PHY_1M;
+		if (hdev->le_features[1] & HCI_LE_PHY_2M) {
+			cp.tx_phys |= HCI_LE_SET_PHY_2M;
+			cp.rx_phys |= HCI_LE_SET_PHY_2M;
+		}
+		hci_req_add(req, HCI_OP_LE_SET_DEFAULT_PHY, sizeof(cp), &cp);
+	}
 
 	/* Enable Secure Connections if supported and configured */
 	if (hci_dev_test_flag(hdev, HCI_SSP_ENABLED) &&
