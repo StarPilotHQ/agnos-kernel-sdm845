@@ -399,6 +399,7 @@ enum {
 #define HCI_LE_PING			0x10
 #define HCI_LE_DATA_LEN_EXT		0x20
 #define HCI_LE_EXT_SCAN_POLICY		0x80
+#define HCI_LE_PHY_2M			0x01
 
 /* Connection modes */
 #define HCI_CM_ACTIVE	0x0000
@@ -1498,6 +1499,16 @@ struct hci_rp_le_read_max_data_len {
 	__le16	rx_time;
 } __packed;
 
+#define HCI_OP_LE_SET_DEFAULT_PHY	0x2031
+struct hci_cp_le_set_default_phy {
+	__u8    all_phys;
+	__u8    tx_phys;
+	__u8    rx_phys;
+} __packed;
+
+#define HCI_LE_SET_PHY_1M		0x01
+#define HCI_LE_SET_PHY_2M		0x02
+
 /* ---- HCI Events ---- */
 #define HCI_EV_INQUIRY_COMPLETE		0x01
 
@@ -1940,6 +1951,14 @@ struct hci_ev_le_data_len_change {
 } __packed;
 
 #define HCI_EV_LE_DIRECT_ADV_REPORT	0x0B
+
+#define HCI_EV_LE_PHY_UPDATE_COMPLETE	0x0c
+struct hci_ev_le_phy_update_complete {
+	__u8    status;
+	__le16  handle;
+	__u8    tx_phy;
+	__u8    rx_phy;
+} __packed;
 struct hci_ev_le_direct_adv_info {
 	__u8	 evt_type;
 	__u8	 bdaddr_type;
